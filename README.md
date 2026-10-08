@@ -7,6 +7,8 @@ Todo el análisis se hace **en tu navegador** con Stockfish 19 (WebAssembly): no
 
 ![Revisión jugada por jugada](screenshots/01-revision-medio-juego.png)
 ![Resumen y precisión](screenshots/02-resumen-precision.png)
+![Análisis libre tras «¿Por qué es un error?»](screenshots/05-analisis-libre-por-que.png)
+![Mis gambitos](screenshots/08-mis-gambitos.png)
 
 ## Qué hace
 
@@ -18,6 +20,24 @@ Todo el análisis se hace **en tu navegador** con Stockfish 19 (WebAssembly): no
 - Tablero interactivo con flecha de la mejor jugada, barra de evaluación animada, lista de jugadas con iconos,
   gráfica de evaluación clicable, precisión por jugador, recuento de clasificaciones y una sección de
   **Sacrificios** (cuáles salieron bien y cuáles no).
+- **Sacrificios y gambitos**: opción (activada por defecto) para contar también los peones entregados a propósito,
+  gráfica de **balance de material**, "máximo material abajo" por jugador y si la **compensación se mantuvo**
+  (el bando que sacrifica conserva ≥ 35 % de probabilidad de ganar durante las 5 jugadas siguientes).
+- **Mis gambitos**: descarga tus partidas recientes (chess.com: últimos 3 meses · Lichess: últimas 100) y agrupa por gambito
+  (Gambito de Rey, Englund, Smith-Morra, Alien, Evans, Evans invertido, otros gambitos y otras aperturas) usando
+  las jugadas iniciales y el nombre ECO/Lichess de la apertura. Muestra partidas, V/T/D y **% de victorias con blancas
+  y con negras**, la lista de partidas para abrirlas en el analizador y, para las partidas que ya analizaste
+  (guardadas en el navegador), **en qué jugada suele llegar tu primer error**.
+- **Análisis libre**: arrastra las piezas desde cualquier posición de la partida, desde la posición inicial o desde un FEN.
+  Stockfish analiza en continuo (profundidad ∞ o hasta 16/20/24/30) y muestra las **3 mejores líneas** (MultiPV 3) con flechas.
+  Tus jugadas forman un **árbol de variantes** (con subvariantes, "hacer línea principal" y "borrar desde aquí"),
+  copiar/pegar FEN y diálogo de **coronación**.
+- Botón **"¿Por qué es un error? · Analizar"** en cada jugada: abre el análisis libre en la posición anterior con
+  la refutación de la jugada (lo que pasa después) y la mejor línea, ambas navegables.
+- **Profundidad configurable** (10–22) o **tiempo por jugada** (0,25–10 s), con estimación del tiempo total y botón
+  **Re-analizar**. Más profundidad = más preciso pero más lento.
+- **Sonidos de madera** al avanzar jugadas y al mover piezas (jugada, captura, jaque, enroque, fin de partida, error),
+  con botón de silencio y volumen. Los ajustes (sonido, volumen, profundidad, notación…) se guardan en el navegador.
 - Navegación: botones o teclado (← → jugada anterior/siguiente, ↑/Inicio y ↓/Fin para ir al principio/final, **F** para girar el tablero).
 
 ## Ejecutarlo en tu computadora
@@ -64,13 +84,20 @@ versión de Stockfish de un solo hilo.
 7. **Precisión**: cada jugada recibe `103.17 · e^(−0.0435 · pérdida) − 3.17`; la precisión de la partida combina la media
    ponderada por volatilidad y la media armónica (método de Lichess, muy similar al de chess.com).
 
+## Sonidos
+
+Los sonidos **no usan archivos de audio**: se sintetizan en el navegador con la Web Audio API
+(ráfaga de ruido filtrada + resonancia grave corta que imita una pieza de madera sobre el tablero).
+Son código propio de este proyecto, sin licencias de terceros.
+
 ## Tecnologías
 
 React + TypeScript + Vite · [chess.js](https://github.com/jhlywa/chess.js) · [chessground](https://github.com/lichess-org/chessground) ·
 [Stockfish.js 19](https://github.com/nmrugg/stockfish.js) (versión *lite single-threaded*, GPLv3) ·
 datos de aperturas de [lichess-org/chess-openings](https://github.com/lichess-org/chess-openings) (CC0).
 
-Pruebas de extremo a extremo: `node tests/e2e.mjs` (requiere el servidor en marcha en el puerto 4173 y Playwright).
+Pruebas de extremo a extremo: `node tests/e2e.mjs` (requiere el servidor en marcha en el puerto 4173 y Playwright;
+`URL=https://d4rm4n.github.io/analizador-ajedrez/ node tests/e2e.mjs` para probar el sitio publicado).
 
 ## Limitaciones
 
@@ -78,3 +105,6 @@ Pruebas de extremo a extremo: `node tests/e2e.mjs` (requiere el servidor en marc
   alguna clasificación puede diferir de chess.com. Sube la profundidad (16–18) para más precisión (más lento).
 - Brillante, Gran jugada y Sacrificios usan heurísticas propias (chess.com no publica su algoritmo exacto).
 - Las importaciones dependen de las API públicas de Chess.com y Lichess (pueden limitar peticiones).
+- Mientras se analiza la partida y a la vez se usa el análisis libre, ambos motores comparten la CPU (van más lentos).
+- La detección de sacrificios es estática (capturas inmediatas): un peón que se deja colgar por descuido también aparece
+  como "sacrificio", normalmente marcado como incorrecto.

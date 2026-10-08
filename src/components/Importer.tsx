@@ -15,7 +15,17 @@ export interface ImportedGame {
   date: Date;
   timeControl: string;
   speed?: string;
+  /** nombre de la apertura (cabecera ECOUrl de chess.com u opening.name de Lichess) */
+  opening?: string;
+  eco?: string;
   url?: string;
+}
+
+function openingFromChessCom(g: any): string | undefined {
+  const url: string | undefined = /\[ECOUrl "([^"]+)"\]/.exec(g.pgn)?.[1] ?? g.eco;
+  if (!url) return undefined;
+  const slug = url.split('/openings/')[1];
+  return slug ? decodeURIComponent(slug).replace(/-/g, ' ').replace(/\.\.\./g, '...') : undefined;
 }
 
 const DRAW_CODES = ['agreed', 'repetition', 'stalemate', 'insufficient', '50move', 'timevsinsufficient'];
@@ -28,7 +38,7 @@ function fmtTc(base: number, inc: number) {
   return inc ? `${b}+${inc}` : `${b} min`;
 }
 
-export async function fetchChessCom(user: string, max = 20): Promise<ImportedGame[]> {
+export async function fetchChessCom(user: string, max = 20, months = 3): Promise<ImportedGame[]> {
   const u = user.trim().toLowerCase();
   const r = await fetch(`https://api.chess.com/pub/player/${encodeURIComponent(u)}/games/archives`);
   if (r.status === 404) throw new Error(`No existe el usuario "${user}" en chess.com.`);
@@ -36,7 +46,7 @@ export async function fetchChessCom(user: string, max = 20): Promise<ImportedGam
   const { archives } = (await r.json()) as { archives: string[] };
   if (!archives?.length) return [];
   const games: any[] = [];
-  for (let i = archives.length - 1; i >= 0 && games.length < max && i >= archives.length - 3; i--) {
+  for (let i = archives.length - 1; i >= 0 && games.length < max && i >= archives.length - months; i--) {
     const a = await fetch(archives[i]);
     if (!a.ok) break;
     const data = await a.json();
@@ -68,6 +78,8 @@ export async function fetchChessCom(user: string, max = 20): Promise<ImportedGam
       date: new Date(g.end_time * 1000),
       timeControl: tc,
       speed: SPEED_ES[g.time_class] ?? g.time_class,
+      opening: openingFromChessCom(g),
+      eco: /\[ECO "([^"]+)"\]/.exec(g.pgn)?.[1],
       url: g.url,
     } as ImportedGame;
   });
@@ -116,6 +128,8 @@ export async function fetchLichess(user: string, max = 20): Promise<ImportedGame
         date: new Date(g.lastMoveAt ?? g.createdAt),
         timeControl: tc,
         speed: SPEED_ES[g.speed] ?? g.speed,
+        opening: g.opening?.name,
+        eco: g.opening?.eco,
         url: `https://lichess.org/${g.id}`,
       } as ImportedGame;
     });

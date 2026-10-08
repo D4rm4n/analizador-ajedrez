@@ -146,14 +146,14 @@ const VAL: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
  * para cada captura legal de una pieza (>= 3 puntos), ganancia = valor capturado
  * − (valor de la pieza capturadora si la casilla queda defendida).
  */
-function maxCaptureGain(c: Chess, onlySquare?: string): number {
+function maxCaptureGain(c: Chess, onlySquare?: string, minTarget = 3): number {
   const defender = c.turn() === 'w' ? 'b' : 'w';
   let maxGain = 0;
   for (const cap of c.moves({ verbose: true })) {
     if (!cap.captured) continue;
     if (onlySquare && cap.to !== onlySquare) continue;
     const target = VAL[cap.captured];
-    if (target < 3) continue; // los peones no cuentan como sacrificio
+    if (target < minTarget) continue; // por defecto los peones no cuentan
     c.move(cap);
     const defended = c.isAttacked(cap.to as Square, defender);
     c.undo();
@@ -170,44 +170,74 @@ function maxCaptureGain(c: Chess, onlySquare?: string): number {
  * (p. ej. salir de un jaque con la dama ya colgada).
  */
 export interface SacrificeInfo {
+  /** material de piezas (>= 3 puntos) entregado de más respecto a la mejor alternativa */
   amount: number;
   /** la pieza que acaba de mover queda capturable con ganancia */
   movedEnPrise: boolean;
+  /** igual pero contando también peones (gambitos) */
+  pawnAmount: number;
+  pawnMovedEnPrise: boolean;
 }
+export const NO_SAC: SacrificeInfo = { amount: 0, movedEnPrise: false, pawnAmount: 0, pawnMovedEnPrise: false };
 
 export function detectSacrifice(move: PlyMove): SacrificeInfo {
-  const none = { amount: 0, movedEnPrise: false };
   const after = new Chess(move.fenAfter);
-  if (after.isCheckmate() || after.isStalemate()) return none;
+  if (after.isCheckmate() || after.isStalemate()) return NO_SAC;
   const capturedByMover = move.captured ? VAL[move.captured] : 0;
   const played = maxCaptureGain(after) - capturedByMover;
-  if (played < 2) return none;
+  const playedP = maxCaptureGain(after, undefined, 1) - capturedByMover;
+  if (played < 2 && playedP < 1) return NO_SAC;
   const before = new Chess(move.fenBefore);
   let minAlt = Infinity;
+  let minAltP = Infinity;
   for (const alt of before.moves({ verbose: true })) {
     if (alt.from + alt.to + (alt.promotion ?? '') === move.uci) continue;
     before.move(alt);
-    const g = before.isCheckmate() ? 0 : maxCaptureGain(before);
+    const mate = before.isCheckmate();
+    const g = mate ? 0 : maxCaptureGain(before);
+    const gp = mate ? 0 : maxCaptureGain(before, undefined, 1);
     before.undo();
     if (g < minAlt) minAlt = g;
-    if (minAlt === 0) break;
+    if (gp < minAltP) minAltP = gp;
+    if (minAlt === 0 && minAltP === 0) break;
   }
-  if (minAlt === Infinity) return none;
-  const movedEnPrise = maxCaptureGain(after, move.to) - capturedByMover >= 2;
-  return { amount: Math.max(0, played - minAlt), movedEnPrise };
+  if (minAlt === Infinity) return NO_SAC;
+  return {
+    amount: played >= 2 ? Math.max(0, played - minAlt) : 0,
+    movedEnPrise: maxCaptureGain(after, move.to) - capturedByMover >= 2,
+    pawnAmount: playedP >= 1 ? Math.max(0, playedP - minAltP) : 0,
+    pawnMovedEnPrise: maxCaptureGain(after, move.to, 1) - capturedByMover >= 1,
+  };
 }
 
 /** ¿La primera jugada de la línea del motor (rival) captura una pieza de >= 3 puntos? */
-function pvTakesMaterial(fen: string, pv: string[] | undefined): boolean {
+function pvTakesMaterial(fen: string, pv: string[] | undefined, minVal = 3): boolean {
   if (!pv?.length) return false;
   const c = new Chess(fen);
   const target = c.get(pv[0].slice(2, 4) as Square);
-  return !!target && VAL[target.type] >= 3;
+  if (target) return VAL[target.type] >= minVal;
+  // captura al paso
+  const mover = c.get(pv[0].slice(0, 2) as Square);
+  return minVal <= 1 && mover?.type === 'p' && pv[0][0] !== pv[0][2];
+}
+
+/** Balance de material (blancas − negras) en cada posición, en puntos */
+export function materialBalance(game: ParsedGame): number[] {
+  const bal = (fen: string) => {
+    let b = 0;
+    for (const ch of fen.split(' ')[0]) {
+      const v = VAL[ch.toLowerCase()];
+      if (v === undefined) continue;
+      b += ch === ch.toUpperCase() ? v : -v;
+    }
+    return b;
+  };
+  return [bal(game.startFen), ...game.moves.map((m) => bal(m.fenAfter))];
 }
 
 /** Pre-calcula los sacrificios de toda la partida (no depende del motor) */
 export function sacrificeMap(game: ParsedGame): SacrificeInfo[] {
-  return game.moves.map((m) => (m.isBook ? { amount: 0, movedEnPrise: false } : detectSacrifice(m)));
+  return game.moves.map((m) => detectSacrifice(m));
 }
 
 /* ---------------- Clasificación ---------------- */
@@ -217,7 +247,7 @@ export function classifyMove(
   prev: PlyMove | undefined,
   before: PositionEval,
   after: PositionEval,
-  sac: SacrificeInfo = { amount: 0, movedEnPrise: false },
+  sac: SacrificeInfo = NO_SAC,
 ): MoveAnalysis {
   const mover = move.color;
   const best = before.lines[0];
@@ -233,8 +263,12 @@ export function classifyMove(
   const loss = isBest ? 0 : Math.max(0, winBefore - winAfter);
   // sacrificio real: entrega >= 2 puntos y, o bien la pieza movida queda colgada,
   // o bien el motor espera que el rival capture material de inmediato
-  const sacrifice = sac.amount >= 2 && (sac.movedEnPrise || pvTakesMaterial(move.fenAfter, after.lines[0]?.pv));
+  const sacrifice = !move.isBook && sac.amount >= 2 && (sac.movedEnPrise || pvTakesMaterial(move.fenAfter, after.lines[0]?.pv));
   const sacrificeAmount = sacrifice ? sac.amount : 0;
+  // sacrificio de peón / gambito (también en jugadas de libro)
+  const pawnSacrifice =
+    !sacrifice && sac.pawnAmount >= 1 && (sac.pawnMovedEnPrise || pvTakesMaterial(move.fenAfter, after.lines[0]?.pv, 1));
+  const pawnSacAmount = pawnSacrifice ? sac.pawnAmount : 0;
 
   let cls: Classification;
   if (move.legalCount === 1) cls = 'forced';
@@ -280,6 +314,8 @@ export function classifyMove(
     isBest,
     sacrifice,
     sacrificeAmount,
+    pawnSacrifice,
+    pawnSacAmount,
   };
 }
 

@@ -4,13 +4,22 @@ import Board from './components/Board';
 import EvalBar from './components/EvalBar';
 import EvalGraph from './components/EvalGraph';
 import Importer, { type ImportedGame } from './components/Importer';
-import { Engine, evaluatePosition } from './engine';
-import { classifyMove, formatScore, gameAccuracy, parsePgn, sacrificeMap } from './analysis';
-import { CLASS_INFO, CLASS_ORDER, ClassIcon, fmtLine, fmtSan, type Notation } from './classes';
+import FreePanel, { isTerminal, type WhyInfo } from './components/FreePanel';
+import { EngineControls, SoundControls } from './components/Controls';
+import { MoveCard, MoveList, PlayerBar } from './components/ReviewParts';
+import { Engine, LiveEngine, evaluatePosition, type LiveUpdate } from './engine';
+import { START_FEN, classifyMove, gameAccuracy, lineToWhiteScore, materialBalance, parsePgn, sacrificeMap, winFor } from './analysis';
+import MaterialGraph from './components/MaterialGraph';
+import GambitStats from './components/GambitStats';
+import { saveAnalyzed } from './gambits';
+import { CLASS_INFO, CLASS_ORDER, ClassIcon, fmtSan, type Notation } from './classes';
 import { SAMPLES } from './samples';
-import type { Classification, Color, MoveAnalysis, ParsedGame, PositionEval } from './types';
+import { DEFAULT_ENGINE, DEFAULT_SOUND, depthCapMs, usePersistent, type EngineSettings } from './settings';
+import { play, setMuted, setVolume, soundForSan } from './sound';
+import { addLine, addMove, deleteNode, newTree, promote, type VTree } from './tree';
+import type { Classification, Color, MoveAnalysis, ParsedGame, PositionEval, Score } from './types';
 
-type Tab = 'summary' | 'moves';
+type Tab = 'summary' | 'moves' | 'free';
 const GOOD: Classification[] = ['brilliant', 'great', 'best', 'excellent', 'good', 'book', 'forced'];
 
 export default function App() {
@@ -19,20 +28,40 @@ export default function App() {
   const [evals, setEvals] = useState<(PositionEval | undefined)[]>([]);
   const [ply, setPly] = useState(0);
   const [orientation, setOrientation] = useState<'white' | 'black'>('white');
-  const [depth, setDepth] = useState(14);
-  const [notation, setNotation] = useState<Notation>('figurine');
+  const [engineCfg, setEngineCfg] = usePersistent<EngineSettings>('aa.engine', DEFAULT_ENGINE);
+  const [soundCfg, setSoundCfg] = usePersistent('aa.sound', DEFAULT_SOUND);
+  const [prefs, setPrefs] = usePersistent<{ notation: Notation; liveLimit: number; pawnSacs: boolean }>('aa.prefs', { notation: 'figurine', liveLimit: 0, pawnSacs: true });
+  const notation = prefs.notation;
   const [status, setStatus] = useState<'idle' | 'loading' | 'analyzing' | 'done' | 'error'>('idle');
   const [error, setError] = useState('');
   const [tab, setTab] = useState<Tab>('moves');
   const [showInput, setShowInput] = useState(true);
   const [engineName, setEngineName] = useState('Stockfish');
+  const [usedCfg, setUsedCfg] = useState<EngineSettings>(engineCfg);
   const engineRef = useRef<Engine | null>(null);
   const runRef = useRef(0);
   const startedAt = useRef(0);
+  const loadedPgn = useRef('');
+  const loadedMeta = useRef<{ id: string; userColor: Color } | null>(null);
+  const [inputTab, setInputTab] = useState<'review' | 'gambits'>('review');
   const [elapsed, setElapsed] = useState(0);
+
+  // ---- análisis libre ----
+  const [tree, setTree] = useState<VTree | null>(null);
+  const [cur, setCur] = useState(0);
+  const [why, setWhy] = useState<WhyInfo | null>(null);
+  const [live, setLive] = useState<LiveUpdate | null>(null);
+  const liveRef = useRef<LiveEngine | null>(null);
+  const [freeFenInput, setFreeFenInput] = useState('');
+
+  useEffect(() => {
+    setMuted(soundCfg.muted);
+    setVolume(soundCfg.volume);
+  }, [soundCfg]);
 
   const total = game?.moves.length ?? 0;
   const done = evals.filter(Boolean).length;
+  const freeMode = tab === 'free' && !!tree && !showInput;
 
   const sacs = useMemo(() => (game ? sacrificeMap(game) : []), [game]);
   const cache = useRef(new Map<number, { b: PositionEval; a: PositionEval; r: MoveAnalysis }>());
@@ -56,24 +85,33 @@ export default function App() {
   );
 
   const start = useCallback(
-    async (text: string, userColor?: Color) => {
+    async (text: string, opts: { userColor?: Color; keepView?: boolean; gameId?: string } = {}) => {
       setError('');
       let g: ParsedGame;
       try {
         g = await parsePgn(text);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
+        play('illegal');
         return;
       }
+      loadedPgn.current = text;
+      if (!opts.keepView) loadedMeta.current = opts.gameId && opts.userColor ? { id: opts.gameId, userColor: opts.userColor } : null;
+      const cfg = engineCfg;
+      setUsedCfg(cfg);
       const run = ++runRef.current;
       engineRef.current?.terminate();
       cache.current.clear();
       setGame(g);
       setEvals([]);
-      setPly(0);
-      setTab('moves');
+      if (!opts.keepView) {
+        setPly(0);
+        setTab('moves');
+        setOrientation(opts.userColor === 'b' ? 'black' : 'white');
+        setTree(null);
+        setWhy(null);
+      }
       setShowInput(false);
-      setOrientation(userColor === 'b' ? 'black' : 'white');
       setStatus('loading');
       startedAt.current = performance.now();
       let engine: Engine;
@@ -95,40 +133,235 @@ export default function App() {
       engine.newGame();
       const ucis = g.moves.map((m) => m.uci);
       const arr: (PositionEval | undefined)[] = new Array(g.moves.length + 1).fill(undefined);
+      const depth = cfg.mode === 'depth' ? cfg.depth : null;
+      const ms = cfg.mode === 'depth' ? depthCapMs(cfg.depth) : cfg.ms;
       for (let i = 0; i <= g.moves.length; i++) {
         const fen = i === 0 ? g.startFen : g.moves[i - 1].fenAfter;
-        const ev = await evaluatePosition(engine, g.startFen, ucis.slice(0, i), fen, depth, 4000);
+        const ev = await evaluatePosition(engine, g.startFen, ucis.slice(0, i), fen, depth, ms);
         if (run !== runRef.current) return;
         arr[i] = ev;
         setEvals([...arr]);
         setElapsed(performance.now() - startedAt.current);
       }
       setStatus('done');
-      setTab('summary');
+      // guardar en caché el primer error del usuario (para "Mis gambitos")
+      const meta = loadedMeta.current;
+      if (meta) {
+        try {
+          const sm = sacrificeMap(g);
+          const an = g.moves.map((m, i) => classifyMove(m, g.moves[i - 1], arr[i]!, arr[i + 1]!, sm[i]));
+          const idx = g.moves.findIndex((m, i) => m.color === meta.userColor && ['mistake', 'blunder'].includes(an[i].classification));
+          const acc = gameAccuracy(g.moves, an, arr);
+          saveAnalyzed(meta.id, {
+            firstError: idx >= 0 ? parseInt(g.moves[idx].fenBefore.split(' ')[5] || '1', 10) : null,
+            userColor: meta.userColor,
+            accuracy: acc[meta.userColor],
+            at: Date.now(),
+          });
+        } catch {
+          /* ignorar */
+        }
+      }
+      if (!opts.keepView) setTab((t) => (t === 'moves' ? 'summary' : t));
     },
-    [depth],
+    [engineCfg],
   );
 
-  useEffect(() => () => engineRef.current?.terminate(), []);
+  useEffect(
+    () => () => {
+      engineRef.current?.terminate();
+      liveRef.current?.terminate();
+    },
+    [],
+  );
 
-  const go = useCallback((p: number) => setPly(Math.max(0, Math.min(total, p))), [total]);
+  /* ---------------- navegación de la partida ---------------- */
+  const result = game?.headers.Result;
+  const go = useCallback(
+    (p: number) => {
+      const np = Math.max(0, Math.min(total, p));
+      if (game && np > ply) {
+        const decisive = result === '1-0' || result === '0-1' || result === '1/2-1/2';
+        play(soundForSan(game.moves[np - 1].san, np === total && decisive));
+      }
+      setPly(np);
+    },
+    [total, ply, game, result],
+  );
 
+  /* ---------------- análisis libre ---------------- */
+  const curNode = tree ? tree.nodes[cur] : null;
+
+  useEffect(() => {
+    if (!freeMode || !curNode) {
+      liveRef.current?.stop();
+      return;
+    }
+    if (!liveRef.current) {
+      liveRef.current = new LiveEngine(3);
+    }
+    const le = liveRef.current;
+    le.onUpdate = (u) => setLive(u);
+    setLive(null);
+    if (isTerminal(curNode.fen)) {
+      le.stop();
+      return;
+    }
+    le.analyse(curNode.fen, prefs.liveLimit || null);
+  }, [freeMode, curNode?.fen, prefs.liveLimit]);
+
+  const liveLines = live && curNode && live.fen === curNode.fen ? live.lines : [];
+  const liveScore: Score | undefined = useMemo(() => {
+    if (!curNode) return undefined;
+    const c = new Chess(curNode.fen);
+    if (c.isCheckmate()) return { kind: 'mate', v: 0, mated: c.turn() };
+    if (c.isStalemate() || c.isInsufficientMaterial()) return { kind: 'cp', v: 0 };
+    if (!liveLines[0]) return undefined;
+    return lineToWhiteScore(liveLines[0], c.turn());
+  }, [curNode, liveLines]);
+
+  const enterFree = useCallback((fen: string) => {
+    const t = newTree(fen);
+    setTree(t);
+    setCur(t.root);
+    setWhy(null);
+    setTab('free');
+    setShowInput(false);
+  }, []);
+
+  const currentFen = useCallback(() => {
+    if (!game) return START_FEN;
+    return ply > 0 ? game.moves[ply - 1].fenAfter : game.startFen;
+  }, [game, ply]);
+
+  const freeMove = useCallback(
+    (uci: string) => {
+      let t = tree;
+      let from = cur;
+      if (!freeMode || !t) {
+        t = newTree(currentFen());
+        from = t.root;
+        setWhy(null);
+        setTab('free');
+        setShowInput(false);
+      }
+      const r = addMove(t, from, uci);
+      if (!r) {
+        play('illegal');
+        setTree(t);
+        return;
+      }
+      const [nt, id] = r;
+      setTree(nt);
+      setCur(id);
+      play(soundForSan(nt.nodes[id].san!));
+    },
+    [tree, cur, freeMode, currentFen],
+  );
+
+  const playLine = useCallback(
+    (pv: string[]) => {
+      if (!tree) return;
+      const [nt, ids] = addLine(tree, cur, pv);
+      if (!ids.length) return;
+      setTree(nt);
+      setCur(ids[ids.length - 1]);
+      play(soundForSan(nt.nodes[ids[ids.length - 1]].san!));
+    },
+    [tree, cur],
+  );
+
+  const freeGo = useCallback(
+    (id: number | undefined) => {
+      if (!tree || id === undefined || !tree.nodes[id]) return;
+      const n = tree.nodes[id];
+      // sonido solo al avanzar (el nuevo nodo es hijo del actual o descendiente)
+      let x: number | null = n.parent;
+      while (x !== null && x !== cur) x = tree.nodes[x].parent;
+      if (x === cur && n.san) play(soundForSan(n.san));
+      setCur(id);
+    },
+    [tree, cur],
+  );
+
+  const whyAnalyze = useCallback(
+    (p: number) => {
+      if (!game) return;
+      const move = game.moves[p - 1];
+      const an = analyses[p - 1];
+      const before = evals[p - 1];
+      const after = evals[p];
+      let t = newTree(move.fenBefore);
+      let playedIds: number[];
+      let bestIds: number[] = [];
+      [t, playedIds] = addLine(t, t.root, [move.uci, ...(after?.lines[0]?.pv ?? []).slice(0, 9)]);
+      if (before?.lines[0]) [t, bestIds] = addLine(t, t.root, before.lines[0].pv.slice(0, 10));
+      setTree(t);
+      setCur(playedIds[0]);
+      setWhy({
+        ply: p,
+        san: move.san,
+        color: move.color,
+        cls: an?.classification ?? 'good',
+        playedIds,
+        bestIds,
+        bestSan: an?.bestSan,
+        loss: an?.loss ?? 0,
+      });
+      setTab('free');
+      play(soundForSan(move.san));
+    },
+    [game, analyses, evals],
+  );
+
+  const loadFen = useCallback(
+    (fen: string) => {
+      try {
+        const c = new Chess(fen);
+        enterFree(c.fen());
+        return true;
+      } catch {
+        play('illegal');
+        return false;
+      }
+    },
+    [enterFree],
+  );
+
+  /* ---------------- teclado ---------------- */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      if (e.key === 'f' || e.key === 'F') {
+        setOrientation((o) => (o === 'white' ? 'black' : 'white'));
+        e.preventDefault();
+        return;
+      }
+      if (freeMode && tree) {
+        const n = tree.nodes[cur];
+        if (e.key === 'ArrowLeft') freeGo(n.parent ?? undefined);
+        else if (e.key === 'ArrowRight') freeGo(n.children[0]);
+        else if (e.key === 'ArrowUp' || e.key === 'Home') freeGo(tree.root);
+        else if (e.key === 'ArrowDown' || e.key === 'End') {
+          let x = n;
+          while (x.children[0] !== undefined) x = tree.nodes[x.children[0]];
+          freeGo(x.id);
+        } else return;
+        e.preventDefault();
+        return;
+      }
       if (!game) return;
       if (e.key === 'ArrowLeft') go(ply - 1);
       else if (e.key === 'ArrowRight') go(ply + 1);
       else if (e.key === 'ArrowUp' || e.key === 'Home') go(0);
       else if (e.key === 'ArrowDown' || e.key === 'End') go(total);
-      else if (e.key === 'f' || e.key === 'F') setOrientation((o) => (o === 'white' ? 'black' : 'white'));
       else return;
       e.preventDefault();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [game, ply, total, go]);
+  }, [game, ply, total, go, freeMode, tree, cur, freeGo]);
 
   const loadFile = (f: File) => {
     const r = new FileReader();
@@ -138,20 +371,52 @@ export default function App() {
 
   const pickImported = (g: ImportedGame) => {
     setPgn(g.pgn);
-    start(g.pgn, g.userColor);
+    setInputTab('review');
+    start(g.pgn, { userColor: g.userColor, gameId: g.url ?? g.id });
   };
 
-  /* ---- datos de la posición actual ---- */
+  /* ---------------- datos de la posición mostrada ---------------- */
   const move = game && ply > 0 ? game.moves[ply - 1] : undefined;
   const an = ply > 0 ? analyses[ply - 1] : undefined;
-  const fen = game ? (move ? move.fenAfter : game.startFen) : new Chess().fen();
-  const curEval = evals[ply];
+  let fen: string;
+  let lastMove: [string, string] | undefined;
+  let boardScore: Score | undefined;
   const arrows: { uci: string; brush: string }[] = [];
-  if (an && move && !an.isBest && an.bestUci && an.classification !== 'book' && an.classification !== 'forced') {
-    arrows.push({ uci: an.bestUci, brush: 'best' });
+  let badge: { square: string; cls: Classification } | undefined;
+
+  if (freeMode && curNode) {
+    fen = curNode.fen;
+    lastMove = curNode.uci ? [curNode.uci.slice(0, 2), curNode.uci.slice(2, 4)] : undefined;
+    boardScore = liveScore;
+    const seen = new Set<string>();
+    liveLines.slice(0, 3).forEach((l, i) => {
+      const u = l.pv[0];
+      if (!u || seen.has(u)) return;
+      seen.add(u);
+      arrows.push({ uci: u, brush: i === 0 ? 'best' : i === 1 ? 'alt1' : 'alt2' });
+    });
+    if (why && cur === tree!.root && tree!.nodes[why.playedIds[0]]) {
+      arrows.push({ uci: tree!.nodes[why.playedIds[0]].uci!, brush: 'played' });
+    }
+    if (why && cur === why.playedIds[0]) badge = { square: curNode.uci!.slice(2, 4), cls: why.cls };
+  } else {
+    fen = game ? (move ? move.fenAfter : game.startFen) : START_FEN;
+    lastMove = move ? [move.from, move.to] : undefined;
+    boardScore = evals[ply]?.white;
+    if (an && move && !an.isBest && an.bestUci && an.classification !== 'book' && an.classification !== 'forced') {
+      arrows.push({ uci: an.bestUci, brush: 'best' });
+    }
+    const e0 = evals[ply];
+    if (!move && e0?.lines[0]) arrows.push({ uci: e0.lines[0].pv[0], brush: 'best' });
+    if (move && an) badge = { square: move.to, cls: an.classification };
   }
-  if (!move && curEval?.lines[0]) arrows.push({ uci: curEval.lines[0].pv[0], brush: 'best' });
-  const inCheck = useMemo(() => new Chess(fen).inCheck(), [fen]);
+  const inCheck = useMemo(() => {
+    try {
+      return new Chess(fen).inCheck();
+    } catch {
+      return false;
+    }
+  }, [fen]);
 
   const h = game?.headers ?? {};
   const players = {
@@ -171,15 +436,51 @@ export default function App() {
     return c;
   }, [analyses, game]);
 
+  const balance = useMemo(() => (game ? materialBalance(game) : []), [game]);
+
+  type SacItem = { ply: number; color: Color; amount: number; pawn: boolean; cls: Classification; ok: boolean; comp: { held: boolean; min: number; lostBefore: boolean } | null };
   const sacrifices = useMemo(() => {
-    const s: Record<Color, { ply: number; san: string; color: Color; amount: number; cls: Classification; ok: boolean }[]> = { w: [], b: [] };
+    const s: Record<Color, SacItem[]> = { w: [], b: [] };
+    if (!game) return s;
     analyses.forEach((a, i) => {
-      if (!a || !game || !a.sacrifice) return;
+      if (!a) return;
+      const pawn = !a.sacrifice && a.pawnSacrifice;
+      if (!a.sacrifice && !(prefs.pawnSacs && pawn)) return;
       const m = game.moves[i];
-      s[m.color].push({ ply: i + 1, san: m.san, color: m.color, amount: a.sacrificeAmount, cls: a.classification, ok: GOOD.includes(a.classification) });
+      // ¿se mantuvo la compensación? prob. de ganar del que sacrifica >= 35 % durante las ~5 jugadas siguientes
+      const end = Math.min(game.moves.length, i + 1 + 10);
+      let min = 100;
+      let complete = true;
+      for (let k = i + 1; k <= end; k++) {
+        const e = evals[k];
+        if (!e) { complete = false; break; }
+        min = Math.min(min, winFor(e.white, m.color));
+      }
+      s[m.color].push({
+        ply: i + 1,
+        color: m.color,
+        amount: pawn ? a.pawnSacAmount : a.sacrificeAmount,
+        pawn,
+        cls: a.classification,
+        ok: GOOD.includes(a.classification),
+        comp: complete ? { held: a.winBefore >= 35 && min >= 35, min, lostBefore: a.winBefore < 35 } : null,
+      });
     });
     return s;
-  }, [analyses, game]);
+  }, [analyses, game, evals, prefs.pawnSacs]);
+
+  const maxDown = useMemo(() => {
+    const r: Record<Color, { amount: number; ply: number }> = { w: { amount: 0, ply: 0 }, b: { amount: 0, ply: 0 } };
+    // un déficit solo cuenta si dura al menos 2 medias jugadas (ignora el instante entre captura y recaptura)
+    balance.forEach((b, i) => {
+      const next = i + 1 < balance.length ? balance[i + 1] : b;
+      const wDown = Math.min(-b, -next);
+      const bDown = Math.min(b, next);
+      if (wDown > r.w.amount) r.w = { amount: wDown, ply: i };
+      if (bDown > r.b.amount) r.b = { amount: bDown, ply: i };
+    });
+    return r;
+  }, [balance]);
 
   const moveLabel = (p: number) => {
     const m = game!.moves[p - 1];
@@ -188,6 +489,25 @@ export default function App() {
   };
 
   const progressPct = total ? (done / (total + 1)) * 100 : 0;
+  const busy = status === 'analyzing' || status === 'loading';
+
+  const navFirst = () => (freeMode && tree ? freeGo(tree.root) : go(0));
+  const navPrev = () => (freeMode && tree ? freeGo(tree.nodes[cur].parent ?? undefined) : go(ply - 1));
+  const navNext = () => (freeMode && tree ? freeGo(tree.nodes[cur].children[0]) : go(ply + 1));
+  const navLast = () => {
+    if (freeMode && tree) {
+      let x = tree.nodes[cur];
+      while (x.children[0] !== undefined) x = tree.nodes[x.children[0]];
+      freeGo(x.id);
+    } else go(total);
+  };
+
+  const selectTab = (t: Tab) => {
+    if (t === 'free') {
+      if (!tree) enterFree(currentFen());
+      else setTab('free');
+    } else setTab(t);
+  };
 
   return (
     <div className="app">
@@ -197,45 +517,47 @@ export default function App() {
           <span>Analizador de Partidas</span>
         </div>
         <div className="top-controls">
+          <SoundControls value={soundCfg} onChange={setSoundCfg} />
           <label>
             Notación
-            <select value={notation} onChange={(e) => setNotation(e.target.value as Notation)}>
+            <select value={notation} onChange={(e) => setPrefs({ ...prefs, notation: e.target.value as Notation })}>
               <option value="figurine">Figuras (♘f3)</option>
               <option value="es">Española (Cf3)</option>
               <option value="en">Inglesa (Nf3)</option>
             </select>
           </label>
-          {game && (
+          {(game || tree) && (
             <button className="btn ghost" onClick={() => setShowInput((s) => !s)} data-testid="new-game">
-              {showInput ? 'Volver a la revisión' : '＋ Nueva partida'}
+              {showInput ? 'Volver al análisis' : '＋ Nueva partida'}
             </button>
           )}
         </div>
-        {(status === 'analyzing' || status === 'loading') && (
-          <div className="top-progress" style={{ width: `${progressPct}%` }} />
-        )}
+        {busy && <div className="top-progress" style={{ width: `${progressPct}%` }} />}
       </header>
 
       <main className="layout">
         <section className="board-area">
-          <PlayerBar name={players[topColor].name} elo={players[topColor].elo} color={topColor} acc={accuracy[topColor]} />
+          <PlayerBar name={players[topColor].name} elo={players[topColor].elo} color={topColor} acc={freeMode ? null : accuracy[topColor]} />
           <div className="board-row">
-            <EvalBar score={curEval?.white} orientation={orientation} />
-            <Board
-              fen={fen}
-              orientation={orientation}
-              lastMove={move ? [move.from, move.to] : undefined}
-              arrows={arrows}
-              badge={move && an ? { square: move.to, cls: an.classification } : undefined}
-              check={inCheck}
-            />
+            <EvalBar score={boardScore} orientation={orientation} />
+            <Board fen={fen} orientation={orientation} lastMove={lastMove} arrows={arrows} badge={badge} check={inCheck} onMove={freeMove} />
           </div>
-          <PlayerBar name={players[botColor].name} elo={players[botColor].elo} color={botColor} acc={accuracy[botColor]} />
+          <PlayerBar name={players[botColor].name} elo={players[botColor].elo} color={botColor} acc={freeMode ? null : accuracy[botColor]} />
         </section>
 
         <aside className="panel">
-          {(!game || showInput) && (
+          {showInput && (
             <div className="input-panel">
+              <div className="seg top-seg">
+                <button className={inputTab === 'review' ? 'on' : ''} onClick={() => setInputTab('review')} data-testid="input-review">
+                  Revisar partida
+                </button>
+                <button className={inputTab === 'gambits' ? 'on' : ''} onClick={() => setInputTab('gambits')} data-testid="input-gambits">
+                  Mis gambitos
+                </button>
+              </div>
+              {inputTab === 'gambits' && <GambitStats onPick={pickImported} />}
+              {inputTab === 'review' && (<>
               <h2>Revisión de partida</h2>
               <p className="muted">Pega una partida en formato PGN, sube un archivo .pgn o importa tus partidas recientes. Stockfish analizará cada jugada directamente en tu navegador.</p>
               <h3>Importar mis partidas</h3>
@@ -255,44 +577,67 @@ export default function App() {
                 </label>
                 {SAMPLES.map((s, i) => (
                   <button key={s.id} className="btn ghost" title={s.name} onClick={() => setPgn(s.pgn)} data-testid={'sample-' + s.id}>
-                    {i === 0 ? 'Ejemplo: Ópera de Morphy' : 'Ejemplo: Partida del siglo'}
+                    {['Ejemplo: Ópera de Morphy', 'Ejemplo: Partida del siglo', 'Ejemplo: Partida inmortal (gambito)'][i]}
                   </button>
                 ))}
               </div>
-              <div className="row">
-                <label className="depth">
-                  Profundidad
-                  <select value={depth} onChange={(e) => setDepth(parseInt(e.target.value, 10))} data-testid="depth">
-                    <option value={10}>10 (muy rápido)</option>
-                    <option value={12}>12 (rápido)</option>
-                    <option value={14}>14 (recomendado)</option>
-                    <option value={16}>16 (preciso)</option>
-                    <option value={18}>18 (lento)</option>
-                  </select>
-                </label>
-                <button className="btn primary big" disabled={!pgn.trim()} onClick={() => start(pgn)} data-testid="analyze">
-                  Analizar partida
+              <EngineControls value={engineCfg} onChange={setEngineCfg} />
+              <button className="btn primary big" disabled={!pgn.trim()} onClick={() => start(pgn)} data-testid="analyze">
+                Analizar partida
+              </button>
+              {error && <div className="error">{error}</div>}
+              <h3>Análisis libre</h3>
+              <p className="muted">Mueve las piezas tú mismo y Stockfish te muestra las 3 mejores líneas en tiempo real. También puedes arrastrar una pieza en el tablero directamente.</p>
+              <div className="row wrap">
+                <button className="btn ghost" onClick={() => enterFree(START_FEN)} data-testid="free-start">
+                  Desde la posición inicial
                 </button>
               </div>
-              {error && <div className="error">{error}</div>}
+              <form className="import-row" onSubmit={(e) => { e.preventDefault(); if (loadFen(freeFenInput.trim())) setFreeFenInput(''); else setError('FEN no válido.'); }}>
+                <input value={freeFenInput} onChange={(e) => setFreeFenInput(e.target.value)} placeholder="…o pega un FEN" data-testid="free-fen" />
+                <button className="btn" type="submit" disabled={!freeFenInput.trim()}>Analizar FEN</button>
+              </form>
+              </>)}
             </div>
           )}
 
-          {game && !showInput && (
+          {!showInput && (game || tree) && (
             <>
               <div className="tabs">
-                <button className={tab === 'summary' ? 'on' : ''} onClick={() => setTab('summary')} data-testid="tab-summary">
-                  Resumen
-                </button>
-                <button className={tab === 'moves' ? 'on' : ''} onClick={() => setTab('moves')} data-testid="tab-moves">
-                  Análisis
+                {game && (
+                  <>
+                    <button className={tab === 'summary' ? 'on' : ''} onClick={() => selectTab('summary')} data-testid="tab-summary">
+                      Resumen
+                    </button>
+                    <button className={tab === 'moves' ? 'on' : ''} onClick={() => selectTab('moves')} data-testid="tab-moves">
+                      Análisis
+                    </button>
+                  </>
+                )}
+                <button className={tab === 'free' ? 'on' : ''} onClick={() => selectTab('free')} data-testid="tab-free">
+                  Análisis libre
                 </button>
               </div>
 
-              {(status === 'analyzing' || status === 'loading') && (
+              {game && tab !== 'free' && (
+                <div className="engine-bar">
+                  <EngineControls
+                    value={engineCfg}
+                    onChange={setEngineCfg}
+                    positions={total + 1}
+                    onReanalyze={() => start(loadedPgn.current, { keepView: true })}
+                    busy={false}
+                    compact
+                  />
+                </div>
+              )}
+
+              {busy && tab !== 'free' && (
                 <div className="progress" data-testid="progress">
                   <div className="progress-text">
-                    {status === 'loading' ? 'Cargando Stockfish…' : `Analizando… ${done}/${total + 1} posiciones · profundidad ${depth}`}
+                    {status === 'loading'
+                      ? 'Cargando Stockfish…'
+                      : `Analizando… ${done}/${total + 1} posiciones · ${usedCfg.mode === 'depth' ? `profundidad ${usedCfg.depth}` : `${usedCfg.ms / 1000} s por jugada`}`}
                   </div>
                   <div className="bar">
                     <div style={{ width: `${progressPct}%` }} />
@@ -301,14 +646,14 @@ export default function App() {
               )}
               {error && <div className="error">{error}</div>}
 
-              {tab === 'summary' && (
+              {game && tab === 'summary' && (
                 <div className="summary" data-testid="summary">
                   <div className="game-title">
                     <strong>{players.w.name}</strong> vs <strong>{players.b.name}</strong>
                     <span className="muted"> · {h.Result ?? ''} {h.Date && h.Date !== '????.??.??' ? '· ' + h.Date.replace(/\./g, '/') : ''}</span>
                     {game.opening && <div className="opening">📖 {game.opening}</div>}
                   </div>
-                  <EvalGraph evals={evals} analyses={analyses} total={total} ply={ply} onSelect={(p) => { go(p); }} height={80} />
+                  <EvalGraph evals={evals} analyses={analyses} total={total} ply={ply} onSelect={(p) => go(p)} height={80} />
                   <div className="acc-row">
                     {(['w', 'b'] as Color[]).map((c) => (
                       <div key={c} className={'acc-card ' + c} data-testid={'acc-' + c}>
@@ -340,23 +685,66 @@ export default function App() {
                   </table>
 
                   <div className="sacs" data-testid="sacrifices">
-                    <h3>Sacrificios</h3>
-                    <p className="muted small">Jugadas que entregan material (≥ 2 puntos) sin recuperación inmediata de igual valor.</p>
+                    <div className="sacs-head">
+                      <h3>Sacrificios</h3>
+                      <label className="toggle" title="Contar también los peones entregados a propósito">
+                        <input type="checkbox" checked={prefs.pawnSacs} onChange={(e) => setPrefs({ ...prefs, pawnSacs: e.target.checked })} data-testid="pawn-sacs" />
+                        <span className="toggle-track"><span /></span>
+                        Incluir peones (gambitos)
+                      </label>
+                    </div>
+                    <p className="muted small">
+                      Jugadas que entregan material {prefs.pawnSacs ? '(piezas o peones)' : '(≥ 2 puntos)'} sin recuperarlo de inmediato.
+                      «Compensación» = el bando que sacrifica mantiene ≥ 35 % de prob. de ganar durante las 5 jugadas siguientes.
+                    </p>
+                    <div className="mat-head small muted">Balance de material (blancas − negras)</div>
+                    <MaterialGraph
+                      balance={balance}
+                      ply={ply}
+                      onSelect={(p) => go(p)}
+                      marks={[...sacrifices.w, ...sacrifices.b].map((x) => ({ ply: x.ply, ok: x.comp ? x.comp.held : null }))}
+                    />
                     <div className="sac-cols">
-                      {(['w', 'b'] as Color[]).map((c) => (
-                        <div key={c} className="sac-col">
-                          <div className="sac-head">{players[c].name}</div>
-                          {sacrifices[c].length === 0 && <div className="muted small">Ninguno</div>}
-                          {sacrifices[c].map((s) => (
-                            <button key={s.ply} className={'sac ' + (s.ok ? 'ok' : 'bad')} onClick={() => { go(s.ply); setTab('moves'); }} data-testid="sac-item">
-                              <ClassIcon cls={s.cls} size={16} />
-                              <span className="sac-move">{moveLabel(s.ply)}</span>
-                              <span className="sac-amt">−{s.amount}</span>
-                              <span className="sac-verdict">{s.ok ? 'Correcto' : 'Incorrecto'} · {CLASS_INFO[s.cls].label}</span>
-                            </button>
-                          ))}
-                        </div>
-                      ))}
+                      {(['w', 'b'] as Color[]).map((c) => {
+                        const list = sacrifices[c];
+                        const held = list.filter((x) => x.comp?.held).length;
+                        const judged = list.filter((x) => x.comp && !x.comp.lostBefore).length;
+                        return (
+                          <div key={c} className="sac-col" data-testid={'sac-col-' + c}>
+                            <div className="sac-head">{players[c].name}</div>
+                            <div className="sac-stats">
+                              <button className="link" onClick={() => go(maxDown[c].ply)} data-testid={'maxdown-' + c}>
+                                Máximo material abajo: <strong>{maxDown[c].amount > 0 ? `−${maxDown[c].amount}` : '0'}</strong>
+                              </button>
+                              {judged > 0 && (
+                                <span>
+                                  Compensación mantenida: <strong>{held}/{judged}</strong>
+                                </span>
+                              )}
+                            </div>
+                            {list.length === 0 && <div className="muted small">Ninguno</div>}
+                            {list.map((s) => (
+                              <button key={s.ply} className={'sac ' + (s.ok ? 'ok' : 'bad')} onClick={() => { setPly(s.ply); setTab('moves'); }} data-testid="sac-item">
+                                <ClassIcon cls={s.cls} size={16} />
+                                <span className="sac-move">
+                                  {moveLabel(s.ply)} {s.pawn && <span className="sac-tag">{s.amount > 1 ? `${s.amount} peones` : 'peón'}</span>}
+                                </span>
+                                <span className="sac-amt">−{s.amount}</span>
+                                <span className="sac-verdict">{s.ok ? 'Correcto' : 'Incorrecto'} · {CLASS_INFO[s.cls].label}</span>
+                                <span className={'sac-comp ' + (s.comp ? (s.comp.lostBefore ? '' : s.comp.held ? 'held' : 'lost') : '')}>
+                                  {!s.comp
+                                    ? 'Compensación: analizando…'
+                                    : s.comp.lostBefore
+                                      ? 'Compensación: — (la posición ya estaba perdida)'
+                                      : s.comp.held
+                                        ? `✓ Compensación (mín. ${s.comp.min.toFixed(0)} %)`
+                                        : `✗ Sin compensación (cayó a ${s.comp.min.toFixed(0)} %)`}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
 
@@ -364,175 +752,52 @@ export default function App() {
                     Revisar jugada por jugada
                   </button>
                   <div className="engine-note muted small">
-                    Motor: {engineName} (WASM lite, 1 hilo) · profundidad {depth}
+                    Motor: {engineName} (WASM lite, 1 hilo) · {usedCfg.mode === 'depth' ? `profundidad ${usedCfg.depth}` : `${usedCfg.ms / 1000} s por jugada`}
                     {status === 'done' && ` · ${(elapsed / 1000).toFixed(0)} s`}
                   </div>
                 </div>
               )}
 
-              {tab === 'moves' && (
+              {game && tab === 'moves' && (
                 <div className="review">
-                  <MoveCard
-                    ply={ply}
-                    game={game}
-                    an={an}
-                    ev={curEval}
-                    notation={notation}
-                  />
-                  <EvalGraph evals={evals} analyses={analyses} total={total} ply={ply} onSelect={go} height={64} />
+                  <MoveCard ply={ply} game={game} an={an} ev={evals[ply]} notation={notation} onWhy={whyAnalyze} />
+                  <EvalGraph evals={evals} analyses={analyses} total={total} ply={ply} onSelect={(p) => go(p)} height={56} />
                   <MoveList game={game} analyses={analyses} ply={ply} onSelect={go} notation={notation} />
                 </div>
               )}
 
+              {freeMode && tree && (
+                <FreePanel
+                  tree={tree}
+                  cur={cur}
+                  setCur={freeGo}
+                  lines={liveLines}
+                  liveDepth={live?.depth ?? 0}
+                  liveDone={!!live?.done}
+                  limit={prefs.liveLimit}
+                  setLimit={(d) => setPrefs({ ...prefs, liveLimit: d })}
+                  notation={notation}
+                  why={why}
+                  onPlayLine={playLine}
+                  onBack={game ? () => setTab('moves') : undefined}
+                  onLoadFen={loadFen}
+                  onDelete={(id) => { const p = tree.nodes[id].parent!; setTree(deleteNode(tree, id)); setCur(p); }}
+                  onPromote={(id) => setTree(promote(tree, id))}
+                  terminal={isTerminal(tree.nodes[cur].fen)}
+                />
+              )}
+
               <div className="nav">
-                <button onClick={() => go(0)} title="Inicio (↑ / Inicio)" data-testid="nav-first">⏮</button>
-                <button onClick={() => go(ply - 1)} title="Anterior (←)" data-testid="nav-prev">◀</button>
-                <button onClick={() => go(ply + 1)} title="Siguiente (→)" data-testid="nav-next">▶</button>
-                <button onClick={() => go(total)} title="Final (↓ / Fin)" data-testid="nav-last">⏭</button>
+                <button onClick={navFirst} title="Inicio (↑ / Inicio)" data-testid="nav-first">⏮</button>
+                <button onClick={navPrev} title="Anterior (←)" data-testid="nav-prev">◀</button>
+                <button onClick={navNext} title="Siguiente (→)" data-testid="nav-next">▶</button>
+                <button onClick={navLast} title="Final (↓ / Fin)" data-testid="nav-last">⏭</button>
                 <button onClick={() => setOrientation((o) => (o === 'white' ? 'black' : 'white'))} title="Girar tablero (F)" data-testid="flip">⟲</button>
               </div>
             </>
           )}
         </aside>
       </main>
-    </div>
-  );
-}
-
-function PlayerBar({ name, elo, color, acc }: { name: string; elo?: string; color: Color; acc: number | null }) {
-  return (
-    <div className="player-bar">
-      <span className={'avatar ' + color}>{color === 'w' ? '♔' : '♚'}</span>
-      <span className="pname">{name}</span>
-      {elo && elo !== '?' && <span className="pelo">({elo})</span>}
-      {acc !== null && <span className="pacc">{acc.toFixed(1)}%</span>}
-    </div>
-  );
-}
-
-function MoveCard({ ply, game, an, ev, notation }: { ply: number; game: ParsedGame; an?: MoveAnalysis; ev?: PositionEval; notation: Notation }) {
-  const move = ply > 0 ? game.moves[ply - 1] : undefined;
-  const evalChip = <span className={'eval-chip ' + (ev && (ev.white.kind === 'mate' ? ev.white.v > 0 || ev.white.mated === 'b' : ev.white.v >= 0) ? 'w' : 'b')} data-testid="move-eval">{ev ? formatScore(ev.white) : '…'}</span>;
-  if (!move) {
-    const best = ev?.lines[0];
-    return (
-      <div className="move-card" data-testid="move-card">
-        <div className="mc-head">
-          <span className="mc-title">Posición inicial</span>
-          {evalChip}
-        </div>
-        {best && (
-          <div className="mc-line">
-            <span className="muted">Línea del motor:</span> {fmtLine(uciToSanSafe(game.startFen, best.pv), game.startFen, notation)}
-          </div>
-        )}
-        <div className="muted small">Usa ← → para moverte por la partida.</div>
-      </div>
-    );
-  }
-  if (!an) {
-    return (
-      <div className="move-card" data-testid="move-card">
-        <div className="mc-head">
-          <span className="mc-title">{fmtSan(move.san, notation, move.color)}</span>
-          {evalChip}
-        </div>
-        <div className="muted small">Analizando esta jugada…</div>
-      </div>
-    );
-  }
-  const info = CLASS_INFO[an.classification];
-  const showBest = !an.isBest && an.bestSan && an.classification !== 'book' && an.classification !== 'forced';
-  return (
-    <div className="move-card" data-testid="move-card" style={{ borderColor: info.color }}>
-      <div className="mc-head">
-        <ClassIcon cls={an.classification} size={26} />
-        <span className="mc-title" style={{ color: info.color }} data-testid="move-class">
-          {fmtSan(move.san, notation, move.color)} {info.phrase}
-        </span>
-        {evalChip}
-      </div>
-      {an.classification === 'book' && move.opening && <div className="mc-line muted">{move.opening}</div>}
-      {an.sacrifice && an.classification !== 'book' && (
-        <div className="mc-line small">⚔️ Sacrificio de material (−{an.sacrificeAmount})</div>
-      )}
-      {showBest && (
-        <div className="mc-best" data-testid="best-move">
-          <ClassIcon cls="best" size={18} />
-          <span>
-            La mejor era <strong>{fmtSan(an.bestSan, notation, move.color)}</strong>
-          </span>
-          <span className="muted small"> (−{an.loss.toFixed(1)}% de prob. de ganar)</span>
-        </div>
-      )}
-      {showBest && an.bestLineSan.length > 0 && (
-        <div className="mc-line">
-          <span className="muted">Mejor línea:</span> {fmtLine(an.bestLineSan, move.fenBefore, notation)}
-        </div>
-      )}
-      {an.afterLineSan.length > 0 && (
-        <div className="mc-line" data-testid="engine-line">
-          <span className="muted">Línea del motor:</span> {fmtLine(an.afterLineSan, move.fenAfter, notation)}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function uciToSanSafe(fen: string, pv: string[]) {
-  const c = new Chess(fen);
-  const out: string[] = [];
-  for (const u of pv.slice(0, 10)) {
-    try {
-      out.push(c.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] }).san);
-    } catch {
-      break;
-    }
-  }
-  return out;
-}
-
-function MoveList({ game, analyses, ply, onSelect, notation }: { game: ParsedGame; analyses: (MoveAnalysis | undefined)[]; ply: number; onSelect: (p: number) => void; notation: Notation }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const el = ref.current?.querySelector('.mv.active') as HTMLElement | null;
-    if (el && ref.current) {
-      const c = ref.current;
-      const top = el.offsetTop - c.offsetTop;
-      if (top < c.scrollTop || top > c.scrollTop + c.clientHeight - 40) c.scrollTop = top - c.clientHeight / 2;
-    }
-  }, [ply]);
-  const rows: { n: number; w?: number; b?: number }[] = [];
-  const firstBlack = game.moves[0]?.color === 'b';
-  let num = parseInt(game.startFen.split(' ')[5] || '1', 10);
-  let i = 0;
-  if (firstBlack) {
-    rows.push({ n: num++, b: 1 });
-    i = 1;
-  }
-  for (; i < game.moves.length; i += 2) rows.push({ n: num++, w: i + 1, b: i + 2 <= game.moves.length ? i + 2 : undefined });
-  const cell = (p?: number) => {
-    if (!p) return <span className="mv empty" />;
-    const m = game.moves[p - 1];
-    const a = analyses[p - 1];
-    return (
-      <button className={'mv' + (p === ply ? ' active' : '')} onClick={() => onSelect(p)} data-testid="move" data-class={a?.classification ?? ''}>
-        {a ? <ClassIcon cls={a.classification} size={16} /> : <span className="ic-ph" />}
-        <span style={a && ['brilliant', 'great', 'inaccuracy', 'mistake', 'blunder'].includes(a.classification) ? { color: CLASS_INFO[a.classification].color } : undefined}>
-          {fmtSan(m.san, notation, m.color)}
-        </span>
-      </button>
-    );
-  };
-  return (
-    <div className="move-list" ref={ref} data-testid="move-list">
-      {rows.map((r) => (
-        <div className="mrow" key={r.n}>
-          <span className="mnum">{r.n}.</span>
-          {cell(r.w)}
-          {cell(r.b)}
-        </div>
-      ))}
     </div>
   );
 }

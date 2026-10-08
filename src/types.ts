@@ -68,6 +68,9 @@ export interface MoveAnalysis {
   sacrifice: boolean;
   /** material neto (en peones) que el rival puede ganar tras la jugada */
   sacrificeAmount: number;
+  /** sacrificio de peón(es) / gambito */
+  pawnSacrifice: boolean;
+  pawnSacAmount: number;
 }
 
 export interface ParsedGame {

@@ -67,13 +67,13 @@ export class Engine {
     }
   }
 
-  async analyse(startFen: string, moves: string[], depth: number, maxMs: number): Promise<EngineLine[]> {
+  async analyse(startFen: string, moves: string[], depth: number | null, maxMs: number): Promise<EngineLine[]> {
     await this.ready;
     return new Promise((resolve) => {
       this.job = { resolve, lines: [] };
       const pos = moves.length ? `position fen ${startFen} moves ${moves.join(' ')}` : `position fen ${startFen}`;
       this.send(pos);
-      this.send(`go depth ${depth} movetime ${maxMs}`);
+      this.send(depth ? `go depth ${depth} movetime ${maxMs}` : `go movetime ${maxMs}`);
     });
   }
 
@@ -92,7 +92,7 @@ export async function evaluatePosition(
   startFen: string,
   moves: string[],
   fen: string,
-  depth: number,
+  depth: number | null,
   maxMs: number,
 ): Promise<PositionEval> {
   const c = new Chess(fen);
@@ -106,4 +106,109 @@ export async function evaluatePosition(
   const lines = await engine.analyse(startFen, moves, depth, maxMs);
   const white = lines[0] ? lineToWhiteScore(lines[0], stm) : { kind: 'cp' as const, v: 0 };
   return { fen, white, lines, depth: lines[0]?.depth ?? 0 };
+}
+
+/* ------------------------------------------------------------------ */
+
+export interface LiveUpdate {
+  fen: string;
+  lines: EngineLine[];
+  depth: number;
+  done: boolean;
+}
+
+/** Motor para el análisis libre: análisis continuo (infinito o hasta una profundidad) con MultiPV */
+export class LiveEngine {
+  private worker: Worker;
+  private ready: Promise<void>;
+  private searching = false;
+  private waiters: { token: string; resolve: () => void }[] = [];
+  private gen = 0;
+  private fen = '';
+  private lines: EngineLine[] = [];
+  private lastEmit = 0;
+  private timer: number | null = null;
+  onUpdate: (u: LiveUpdate) => void = () => {};
+
+  constructor(multiPv = 3) {
+    const w = new Worker(import.meta.env.BASE_URL + ENGINE_FILE);
+    this.worker = w;
+    w.onmessage = (e) => this.onLine(String(e.data));
+    this.ready = (async () => {
+      w.postMessage('uci');
+      await this.waitFor('uciok');
+      w.postMessage('setoption name Hash value 64');
+      w.postMessage(`setoption name MultiPV value ${multiPv}`);
+      w.postMessage('isready');
+      await this.waitFor('readyok');
+    })();
+  }
+
+  private waitFor(token: string) {
+    return new Promise<void>((resolve) => this.waiters.push({ token, resolve }));
+  }
+
+  private emit(done = false) {
+    const lines = this.lines.filter(Boolean);
+    this.onUpdate({ fen: this.fen, lines: [...lines], depth: lines[0]?.depth ?? 0, done });
+    this.lastEmit = performance.now();
+  }
+
+  private onLine(line: string) {
+    if (line.startsWith('bestmove')) {
+      this.searching = false;
+      if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+      if (this.fen) this.emit(true);
+    }
+    for (const w of [...this.waiters]) {
+      if (line.startsWith(w.token)) {
+        this.waiters.splice(this.waiters.indexOf(w), 1);
+        w.resolve();
+      }
+    }
+    if (!this.searching || !line.startsWith('info ') || !line.includes(' pv ') || !line.includes(' score ')) return;
+    if (line.includes('lowerbound') || line.includes('upperbound')) return;
+    const t = line.split(' ');
+    const get = (k: string) => t[t.indexOf(k) + 1];
+    const depth = parseInt(get('depth'), 10);
+    const mpv = t.includes('multipv') ? parseInt(get('multipv'), 10) : 1;
+    const si = t.indexOf('score');
+    const kind = t[si + 1] === 'mate' ? 'mate' : 'cp';
+    const v = parseInt(t[si + 2], 10);
+    const pv = t.slice(t.indexOf('pv') + 1);
+    // al empezar una nueva profundidad, las líneas secundarias antiguas se mantienen hasta ser reemplazadas
+    this.lines[mpv - 1] = { depth, kind, v, pv };
+    const now = performance.now();
+    if (now - this.lastEmit > 200) this.emit();
+    else if (!this.timer) this.timer = window.setTimeout(() => { this.timer = null; this.emit(); }, 200);
+  }
+
+  /** Analiza `fen` (detiene el análisis anterior). depth = null → infinito */
+  async analyse(fen: string, depth: number | null) {
+    const g = ++this.gen;
+    await this.ready;
+    if (this.searching) {
+      this.worker.postMessage('stop');
+      await this.waitFor('bestmove');
+    }
+    if (g !== this.gen) return;
+    this.fen = fen;
+    this.lines = [];
+    this.searching = true;
+    this.worker.postMessage(`position fen ${fen}`);
+    this.worker.postMessage(depth ? `go depth ${depth}` : 'go infinite');
+  }
+
+  async stop() {
+    ++this.gen;
+    this.fen = '';
+    if (this.searching) {
+      this.worker.postMessage('stop');
+      await this.waitFor('bestmove');
+    }
+  }
+
+  terminate() {
+    this.worker.terminate();
+  }
 }
